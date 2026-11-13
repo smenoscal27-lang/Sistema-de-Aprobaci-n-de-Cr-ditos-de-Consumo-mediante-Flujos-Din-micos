@@ -1,7 +1,8 @@
 node_modules/
-*.sqlite
-*.sqlite-journal
-*.sqlite-wal
-*.sqlite-shm
+dist/
 .env
+creditos.db
+creditos.db-wal
+creditos.db-shm
+*.log
 

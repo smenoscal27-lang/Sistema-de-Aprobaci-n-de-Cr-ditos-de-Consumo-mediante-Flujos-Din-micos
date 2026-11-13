@@ -1,36 +1,33 @@
 /**
- * database.js - Configuración y esquema de base de datos SQLite
- * Proyecto: IAM Ligero para PyMEs
- *
- * Características de rendimiento y seguridad:
- * - WAL Mode (Write-Ahead Logging) para concurrencia y lecturas ultrarrápidas (< 1ms).
- * - Llaves foráneas habilitadas explícitamente (PRAGMA foreign_keys = ON).
- * - Triggers de inmutabilidad en bitácora de auditoría (WORM: Write Once, Read Many).
+ * ============================================================================
+ * SISTEMA DE APROBACIÓN DE CRÉDITOS DE CONSUMO MEDIANTE FLUJOS DINÁMICOS (BPM)
+ * Modulo: Configuración y Esquema de Base de Datos SQLite (Modo WAL)
+ * ============================================================================
  */
 
-const sqlite3 = require('sqlite3').verbose();
-const path = require('path');
 require('dotenv').config();
+const path = require('path');
+const sqlite3 = require('sqlite3').verbose();
 
-const DB_PATH = path.resolve(__dirname, process.env.DB_FILE || 'iam_database.sqlite');
+const DB_PATH = process.env.DB_PATH || path.resolve(__dirname, 'creditos.db');
 
-// Inicialización de la conexión
+// Instancia de conexión a SQLite
 const db = new sqlite3.Database(DB_PATH, (err) => {
   if (err) {
     console.error('[-] Error crítico al abrir la base de datos SQLite:', err.message);
   } else {
-    console.log(`[+] Conexión establecida con la base de datos SQLite: ${DB_PATH}`);
+    console.log(`[+] Conexión establecida con SQLite en: ${DB_PATH}`);
   }
 });
 
 /**
- * Envoltorios de Promesas para operaciones asíncronas con async/await
+ * Promisificación de métodos SQLite para arquitectura basada en async/await
  */
 const dbRun = (sql, params = []) => {
   return new Promise((resolve, reject) => {
     db.run(sql, params, function (err) {
       if (err) return reject(err);
-      resolve({ id: this.lastID, changes: this.changes });
+      resolve({ lastID: this.lastID, changes: this.changes });
     });
   });
 };
@@ -54,113 +51,120 @@ const dbAll = (sql, params = []) => {
 };
 
 /**
- * Inicialización del esquema y triggers de inmutabilidad
+ * Inicialización de Pragmas de Alto Rendimiento, Esquemas y Triggers de Inmutabilidad
  */
-const initDatabase = async () => {
+const initDatabase = () => {
   return new Promise((resolve, reject) => {
     db.serialize(async () => {
       try {
-        // 1. Pragmas de optimización y consistencia referencial
+        console.log('[*] Aplicando pragmas de alto rendimiento y concurrencia (WAL)...');
+
+        // 1. Pragmas de Concurrencia e Integridad
         await dbRun('PRAGMA foreign_keys = ON;');
-        await dbRun('PRAGMA journal_mode = WAL;');
+        const journalMode = await dbGet('PRAGMA journal_mode = WAL;');
+        console.log(`[+] Modo de diario SQLite configurado: ${journalMode.journal_mode.toUpperCase()}`);
+
         await dbRun('PRAGMA synchronous = NORMAL;');
         await dbRun('PRAGMA busy_timeout = 5000;');
 
-        // 2. Tabla: roles
+        console.log('[*] Verificando y creando esquemas relacionales BPM...');
+
+        // 2. Tabla: solicitudes_credito (Entidad Raíz del Proceso BPM)
         await dbRun(`
-          CREATE TABLE IF NOT EXISTS roles (
+          CREATE TABLE IF NOT EXISTS solicitudes_credito (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            nombre TEXT NOT NULL UNIQUE,
-            permisos_json TEXT NOT NULL DEFAULT '[]',
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            cliente_nombre TEXT NOT NULL,
+            cliente_cedula TEXT NOT NULL,
+            ingresos_mensuales REAL NOT NULL CHECK (ingresos_mensuales >= 0),
+            monto_solicitado REAL NOT NULL CHECK (monto_solicitado > 0),
+            plazo_meses INTEGER NOT NULL CHECK (plazo_meses > 0),
+            estado_actual TEXT NOT NULL DEFAULT 'Recibido' CHECK (
+              estado_actual IN ('Recibido', 'Revision_Riesgo', 'En_Evaluacion', 'Tareas_Paralelas', 'Aprobado', 'Rechazado', 'Cancelado')
+            ),
+            nivel_riesgo TEXT DEFAULT 'Pendiente',
+            asesor_id TEXT,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
           );
         `);
 
-        // 3. Tabla: usuarios
+        // Índices para búsquedas frecuentes y filtros de cola de trabajo BPM
+        await dbRun('CREATE INDEX IF NOT EXISTS idx_solicitudes_cedula ON solicitudes_credito(cliente_cedula);');
+        await dbRun('CREATE INDEX IF NOT EXISTS idx_solicitudes_estado ON solicitudes_credito(estado_actual);');
+
+        // 3. Tabla: reglas_negocio (Motor de Reglas / Declarative Rules Engine)
         await dbRun(`
-          CREATE TABLE IF NOT EXISTS usuarios (
+          CREATE TABLE IF NOT EXISTS reglas_negocio (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            nombre TEXT NOT NULL,
-            email TEXT NOT NULL UNIQUE,
-            password_hash TEXT NOT NULL,
-            secret_2fa TEXT,
-            "2fa_activo" INTEGER NOT NULL DEFAULT 0 CHECK ("2fa_activo" IN (0, 1)),
-            estado TEXT NOT NULL DEFAULT 'activo' CHECK (estado IN ('activo', 'inactivo')),
-            rol_id INTEGER,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (rol_id) REFERENCES roles(id) ON DELETE RESTRICT
+            nombre_regla TEXT NOT NULL UNIQUE,
+            condicion_json TEXT NOT NULL,
+            accion_resultado TEXT NOT NULL,
+            activo INTEGER NOT NULL DEFAULT 1 CHECK (activo IN (0, 1)),
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
           );
         `);
 
-        // 4. Tabla: aplicaciones_sso
+        // 4. Tabla: tareas_paralelas (Sub-flujos / Patrón Fork-Join BPM)
         await dbRun(`
-          CREATE TABLE IF NOT EXISTS aplicaciones_sso (
+          CREATE TABLE IF NOT EXISTS tareas_paralelas (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            nombre_app TEXT NOT NULL,
-            url_destino TEXT NOT NULL,
-            client_secret TEXT NOT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            solicitud_id INTEGER NOT NULL,
+            tipo_tarea TEXT NOT NULL CHECK (
+              tipo_tarea IN ('Verificacion_Domicilio', 'Referencias_Telefonicas', 'Validacion_Laboral', 'Consulta_Buro', 'Inspeccion_Garantias')
+            ),
+            estado TEXT NOT NULL DEFAULT 'Pendiente' CHECK (
+              estado IN ('Pendiente', 'En_Proceso', 'Completada', 'Rechazada', 'Cancelada')
+            ),
+            asignado_a TEXT,
+            observaciones TEXT,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            completed_at DATETIME,
+            FOREIGN KEY (solicitud_id) REFERENCES solicitudes_credito(id) ON DELETE RESTRICT
           );
         `);
 
-        // 5. Tabla: bitacora_auditoria
+        await dbRun('CREATE INDEX IF NOT EXISTS idx_tareas_solicitud ON tareas_paralelas(solicitud_id);');
+        await dbRun('CREATE INDEX IF NOT EXISTS idx_tareas_estado ON tareas_paralelas(estado);');
+
+        // 5. Tabla: bitacora_auditoria (Event Log Inmutable / Compliance Financiero)
         await dbRun(`
           CREATE TABLE IF NOT EXISTS bitacora_auditoria (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            usuario_id INTEGER,
-            accion_realizada TEXT NOT NULL,
-            ip_origen TEXT,
-            resultado TEXT NOT NULL,
-            FOREIGN KEY (usuario_id) REFERENCES usuarios(id) ON DELETE SET NULL
+            timestamp DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            solicitud_id INTEGER,
+            accion TEXT NOT NULL,
+            usuario_responsable TEXT NOT NULL,
+            resultado TEXT,
+            FOREIGN KEY (solicitud_id) REFERENCES solicitudes_credito(id) ON DELETE SET NULL
           );
         `);
 
-        // 6. Índices para acelerar búsquedas críticas (sub-segundo garantizado)
-        await dbRun('CREATE INDEX IF NOT EXISTS idx_usuarios_email ON usuarios(email);');
-        await dbRun('CREATE INDEX IF NOT EXISTS idx_auditoria_timestamp ON bitacora_auditoria(timestamp);');
-        await dbRun('CREATE INDEX IF NOT EXISTS idx_auditoria_usuario ON bitacora_auditoria(usuario_id);');
+        await dbRun('CREATE INDEX IF NOT EXISTS idx_bitacora_solicitud ON bitacora_auditoria(solicitud_id);');
+        await dbRun('CREATE INDEX IF NOT EXISTS idx_bitacora_timestamp ON bitacora_auditoria(timestamp);');
 
-        // 7. TRIGGERS DE INMUTABILIDAD EN bitacora_auditoria (REGLA CRÍTICA DE AUDITORÍA)
-        // Bloquea cualquier intento de UPDATE y aborta la transacción
+        // 6. TRIGGERS DE SEGURIDAD CRÍTICA: Inmutabilidad Estricta (WORM: Write Once, Read Many)
+        // Bloqueo total de sentencias UPDATE
         await dbRun(`
-          CREATE TRIGGER IF NOT EXISTS trg_bitacora_bloquear_update
+          CREATE TRIGGER IF NOT EXISTS trg_prevent_update_bitacora_auditoria
           BEFORE UPDATE ON bitacora_auditoria
           BEGIN
-            SELECT RAISE(ABORT, 'Violación de seguridad: La bitácora de auditoría es estrictamente inmutable. Los UPDATE están prohibidos.');
+            SELECT RAISE(ABORT, 'VIOLACION CRITICA DE AUDITORIA: Los registros en bitacora_auditoria son estrictamente inmutables. Operacion UPDATE denegada.');
           END;
         `);
 
-        // Bloquea cualquier intento de DELETE y aborta la transacción
+        // Bloqueo total de sentencias DELETE
         await dbRun(`
-          CREATE TRIGGER IF NOT EXISTS trg_bitacora_bloquear_delete
+          CREATE TRIGGER IF NOT EXISTS trg_prevent_delete_bitacora_auditoria
           BEFORE DELETE ON bitacora_auditoria
           BEGIN
-            SELECT RAISE(ABORT, 'Violación de seguridad: La bitácora de auditoría es estrictamente inmutable. Los DELETE están prohibidos.');
+            SELECT RAISE(ABORT, 'VIOLACION CRITICA DE AUDITORIA: Los registros en bitacora_auditoria son estrictamente inmutables. Operacion DELETE denegada.');
           END;
         `);
 
-        // 8. Roles iniciales (Principio de Menor Privilegio)
-        const adminRole = await dbGet('SELECT id FROM roles WHERE nombre = ?', ['Administrador']);
-        if (!adminRole) {
-          await dbRun(
-            'INSERT INTO roles (nombre, permisos_json) VALUES (?, ?)',
-            ['Administrador', JSON.stringify(['*'])]
-          );
-        }
-
-        const employeeRole = await dbGet('SELECT id FROM roles WHERE nombre = ?', ['Empleado']);
-        if (!employeeRole) {
-          await dbRun(
-            'INSERT INTO roles (nombre, permisos_json) VALUES (?, ?)',
-            ['Empleado', JSON.stringify(['read:profile'])]
-          );
-        }
-
-        console.log('[+] Esquema y Triggers de inmutabilidad inicializados correctamente.');
-        resolve();
+        console.log('[+] Tablas, índices y triggers de auditoría inmutable inicializados exitosamente.');
+        resolve(db);
       } catch (error) {
-        console.error('[-] Error inicializando esquema de base de datos:', error);
+        console.error('[-] Error durante la inicialización de la base de datos:', error);
         reject(error);
       }
     });
@@ -174,3 +178,4 @@ module.exports = {
   dbAll,
   initDatabase
 };
+
